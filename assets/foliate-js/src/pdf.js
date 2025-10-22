@@ -493,22 +493,50 @@ const annotationLayerBuilderCSS = `
 }
 `
 
-const renderPage = async (page, getImageBlob) => {
+const MAX_DEVICE_SCALE = 2
+const MAX_DISPLAY_SCALE = 1.5
 
-    const naturalPdfSize = page.getViewport({ scale: 1 })
-    const naturalPdfRatio = naturalPdfSize.width / naturalPdfSize.height
-    const appRatio = innerWidth / innerHeight
-    const pdfToAppResolutionRatio = appRatio / naturalPdfRatio
+const canvasPool = []
 
-    const scale = devicePixelRatio * pdfToAppResolutionRatio
+const acquireCanvas = (width, height) => {
+    const canvas = canvasPool.pop() || document.createElement('canvas')
+    canvas.width = width
+    canvas.height = height
+    return canvas
+}
+
+const releaseCanvas = canvas => {
+    if (!canvas) return
+    canvas.width = canvas.height = 0
+    canvasPool.push(canvas)
+}
+
+const renderPage = async (page, options = {}) => {
+    const { getImageBlob = false } = options
+
+    const viewportAtScale1 = page.getViewport({ scale: 1 })
+    const fittedWidthScale = viewportAtScale1.width
+        ? innerWidth / viewportAtScale1.width
+        : 1
+    const cssScale = Math.min(
+        Math.max(fittedWidthScale || 1, 0.5),
+        MAX_DISPLAY_SCALE,
+    )
+    const pixelScale = Math.min(devicePixelRatio || 1, MAX_DEVICE_SCALE)
+    const scale = cssScale * pixelScale
     const viewport = page.getViewport({ scale })
 
-    const canvas = document.createElement('canvas')
-    canvas.height = viewport.height
-    canvas.width = viewport.width
-    const canvasContext = canvas.getContext('2d')
+    const canvas = acquireCanvas(
+        Math.round(viewport.width),
+        Math.round(viewport.height),
+    )
+    const canvasContext = canvas.getContext('2d', { alpha: false })
+
     await page.render({ canvasContext, viewport }).promise
-    const blob = await new Promise(resolve => canvas.toBlob(resolve))
+    const blob = await new Promise((resolve, reject) =>
+        canvas.toBlob(result => result ? resolve(result) : reject(new Error('Failed to render PDF page'))),
+    )
+    releaseCanvas(canvas)
     if (getImageBlob) return blob
 
     /*
@@ -538,7 +566,7 @@ const renderPage = async (page, getImageBlob) => {
     })
 
     const src = URL.createObjectURL(blob)
-    const url = URL.createObjectURL(new Blob([`
+    const htmlBlob = new Blob([`
         <!DOCTYPE html>
         <meta charset="utf-8">
         <style>
@@ -549,14 +577,24 @@ const renderPage = async (page, getImageBlob) => {
             margin: 0;
             padding: 0;
         }
+        img {
+            display: block;
+            max-width: 100%;
+            height: auto;
+        }
         ${textLayerBuilderCSS}
         ${annotationLayerBuilderCSS}
         </style>
         <img src="${src}">
         ${container.outerHTML}
         ${div.outerHTML}
-    `], { type: 'text/html' }))
-    return url
+    `], { type: 'text/html' })
+    const url = URL.createObjectURL(htmlBlob)
+    const revoke = () => {
+        URL.revokeObjectURL(src)
+        URL.revokeObjectURL(url)
+    }
+    return { url, revoke }
 }
 
 const makeTOCItem = item => ({
@@ -580,21 +618,122 @@ export const makePDF = async file => {
     const outline = await pdf.getOutline()
     book.toc = outline?.map(makeTOCItem)
 
+    const MAX_CACHE_ENTRIES = 6
+    const PREFETCH_DISTANCE = 2
     const cache = new Map()
+    const inflightRenders = new Map()
+    const prefetching = new Set()
+    const idleCancels = new Map()
+    let destroyed = false
+
+    const ensureActive = () => {
+        if (destroyed) throw new Error('PDF book has been destroyed')
+    }
+
+    const releaseEntry = entry => {
+        try {
+            entry?.revoke?.()
+        } catch (error) {
+            console.error('Failed to release PDF page resources', error)
+        }
+    }
+
+    const enforceCacheLimit = () => {
+        while (cache.size > MAX_CACHE_ENTRIES) {
+            const [index, entry] = cache.entries().next().value
+            cache.delete(index)
+            releaseEntry(entry)
+        }
+    }
+
+    const getRenderTask = index => {
+        ensureActive()
+        let task = inflightRenders.get(index)
+        if (!task) {
+            task = (async () => {
+                const page = await pdf.getPage(index + 1)
+                try {
+                    const rendered = await renderPage(page)
+                    return rendered
+                } finally {
+                    if (typeof page.cleanup === 'function') page.cleanup()
+                }
+            })()
+            inflightRenders.set(index, task)
+            task.finally(() => inflightRenders.delete(index))
+        }
+        return task
+    }
+
+    const storeInCache = (index, entry) => {
+        const existing = cache.get(index)
+        if (existing && existing !== entry) releaseEntry(existing)
+        cache.set(index, entry)
+        enforceCacheLimit()
+    }
+
+    const schedulePrefetch = index => {
+        if (index < 0 || index >= pdf.numPages) return
+        if (cache.has(index) || inflightRenders.has(index) || prefetching.has(index)) return
+
+        const run = async () => {
+            idleCancels.delete(index)
+            try {
+                if (destroyed) return
+                const entry = await getRenderTask(index)
+                if (destroyed) {
+                    releaseEntry(entry)
+                    return
+                }
+                storeInCache(index, entry)
+            } catch (error) {
+                console.error('Failed to prefetch PDF page', error)
+            } finally {
+                prefetching.delete(index)
+            }
+        }
+
+        prefetching.add(index)
+        if (typeof requestIdleCallback === 'function') {
+            const id = requestIdleCallback(() => run(), { timeout: 500 })
+            const cancel = typeof cancelIdleCallback === 'function'
+                ? () => cancelIdleCallback(id)
+                : () => clearTimeout(id)
+            idleCancels.set(index, cancel)
+        } else {
+            const id = setTimeout(() => run(), 100)
+            idleCancels.set(index, () => clearTimeout(id))
+        }
+    }
+
+    const prefetchAround = index => {
+        for (let offset = 1; offset <= PREFETCH_DISTANCE; offset += 1) {
+            schedulePrefetch(index + offset)
+            schedulePrefetch(index - offset)
+        }
+    }
+
     book.sections = Array.from({ length: pdf.numPages }).map((_, i) => ({
         id: i,
         load: async () => {
+            ensureActive()
             const cached = cache.get(i)
-            if (cached) return cached
-            const url = await renderPage(await pdf.getPage(i + 1))
-            cache.set(i, url)
-            return url
+            if (cached) {
+                prefetchAround(i)
+                return cached.url
+            }
+
+            const entry = await getRenderTask(i)
+            storeInCache(i, entry)
+            prefetchAround(i)
+            return entry.url
         },
         size: 1000,
     }))
     book.sections[0].pageSpread = 'right'
     book.isExternal = uri => /^\w+:/i.test(uri)
     book.resolveHref = async href => {
+        ensureActive()
         const parsed = JSON.parse(href)
         const dest = typeof parsed === 'string'
             ? await pdf.getDestination(parsed) : parsed
@@ -602,6 +741,7 @@ export const makePDF = async file => {
         return { index }
     }
     book.splitTOCHref = async href => {
+        ensureActive()
         const parsed = JSON.parse(href)
         const dest = typeof parsed === 'string'
             ? await pdf.getDestination(parsed) : parsed
@@ -609,6 +749,28 @@ export const makePDF = async file => {
         return [index, null]
     }
     book.getTOCFragment = doc => doc.documentElement
-    book.getCover = async () => renderPage(await pdf.getPage(1), true)
+    book.getCover = async () => {
+        ensureActive()
+        const page = await pdf.getPage(1)
+        try {
+            return await renderPage(page, { getImageBlob: true })
+        } finally {
+            if (typeof page.cleanup === 'function') page.cleanup()
+        }
+    }
+    book.destroy = () => {
+        destroyed = true
+        idleCancels.forEach(cancel => {
+            try {
+                cancel()
+            } catch (error) {
+                console.error('Failed to cancel PDF prefetch task', error)
+            }
+        })
+        idleCancels.clear()
+        cache.forEach(releaseEntry)
+        cache.clear()
+        prefetching.clear()
+    }
     return book
 }
